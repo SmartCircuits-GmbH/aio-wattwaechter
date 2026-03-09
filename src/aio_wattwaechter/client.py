@@ -77,6 +77,7 @@ class Wattwaechter:
         token: str | None = None,
         session: aiohttp.ClientSession | None = None,
         request_timeout: int = DEFAULT_TIMEOUT,
+        max_retries: int = 3,
     ) -> None:
         """Initialize the WattWächter client."""
         self._host = host
@@ -84,6 +85,7 @@ class Wattwaechter:
         self._session = session
         self._close_session = False
         self._request_timeout = request_timeout
+        self._max_retries = max_retries
         self._base_url = f"http://{host}/api/v1"
 
     @property
@@ -114,26 +116,47 @@ class Wattwaechter:
         json_data: dict[str, Any] | None = None,
         params: dict[str, str] | None = None,
     ) -> aiohttp.ClientResponse:
-        """Execute an HTTP request and handle connection errors.
+        """Execute an HTTP request with automatic retry on 429/503.
 
         Returns the raw aiohttp response for further processing.
         """
         session = await self._ensure_session()
         url = f"{self._base_url}{path}"
+        last_err: Exception | None = None
 
-        try:
-            async with asyncio.timeout(self._request_timeout):
-                return await session.request(
-                    method,
-                    url,
-                    headers=self._headers(require_auth),
-                    json=json_data,
-                    params=params,
-                )
-        except (asyncio.TimeoutError, aiohttp.ClientError) as err:
-            raise WattwaechterConnectionError(
-                f"Cannot connect to {self._host}: {err}"
-            ) from err
+        for attempt in range(self._max_retries):
+            try:
+                async with asyncio.timeout(self._request_timeout):
+                    resp = await session.request(
+                        method,
+                        url,
+                        headers=self._headers(require_auth),
+                        json=json_data,
+                        params=params,
+                    )
+            except (asyncio.TimeoutError, aiohttp.ClientError) as err:
+                raise WattwaechterConnectionError(
+                    f"Cannot connect to {self._host}: {err}"
+                ) from err
+
+            if resp.status not in (429, 503):
+                return resp
+
+            # Retry on rate limit or device busy
+            retry_after = resp.headers.get("Retry-After")
+            wait = int(retry_after) if retry_after else (attempt + 1)
+            _LOGGER.debug(
+                "Request to %s returned %s, retrying in %ss (attempt %d/%d)",
+                path, resp.status, wait, attempt + 1, self._max_retries,
+            )
+            last_err = WattwaechterRateLimitError(
+                "Rate limit exceeded", retry_after=wait
+            ) if resp.status == 429 else WattwaechterConnectionError(
+                f"Device busy (503), retry after {wait}s"
+            )
+            await asyncio.sleep(wait)
+
+        raise last_err  # type: ignore[misc]
 
     def _handle_error_status(self, resp: aiohttp.ClientResponse, path: str) -> None:
         """Raise appropriate exceptions for HTTP error status codes."""
@@ -158,19 +181,6 @@ class Wattwaechter:
         if resp.status == 413:
             raise WattwaechterPayloadTooLargeError(
                 "Request payload too large"
-            )
-
-        if resp.status == 429:
-            retry_after = resp.headers.get("Retry-After")
-            raise WattwaechterRateLimitError(
-                "Rate limit exceeded",
-                retry_after=int(retry_after) if retry_after else None,
-            )
-
-        if resp.status == 503:
-            retry_after = resp.headers.get("Retry-After")
-            raise WattwaechterConnectionError(
-                f"Device busy (503), retry after {retry_after}s"
             )
 
     async def _request(

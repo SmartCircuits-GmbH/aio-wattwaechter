@@ -659,16 +659,38 @@ async def test_payload_too_large_error(mock_api: aioresponses) -> None:
 
 
 async def test_rate_limit_error(mock_api: aioresponses) -> None:
-    """Test 429 raises WattwaechterRateLimitError."""
+    """Test 429 raises WattwaechterRateLimitError after all retries exhausted."""
+    for _ in range(3):
+        mock_api.get(
+            f"{BASE_URL}/system/info",
+            status=429,
+            headers={"Retry-After": "0"},
+        )
+    async with Wattwaechter("192.168.1.100", token="test") as client:
+        with pytest.raises(WattwaechterRateLimitError):
+            await client.system_info()
+
+
+async def test_rate_limit_retry_succeeds(mock_api: aioresponses) -> None:
+    """Test 429 is retried and succeeds on second attempt."""
     mock_api.get(
         f"{BASE_URL}/system/info",
         status=429,
-        headers={"Retry-After": "5"},
+        headers={"Retry-After": "0"},
+    )
+    mock_api.get(
+        f"{BASE_URL}/system/info",
+        payload={
+            "uptime": [],
+            "wifi": [],
+            "ap": [],
+            "esp": [],
+            "heap": [],
+        },
     )
     async with Wattwaechter("192.168.1.100", token="test") as client:
-        with pytest.raises(WattwaechterRateLimitError) as exc_info:
-            await client.system_info()
-    assert exc_info.value.retry_after == 5
+        result = await client.system_info()
+    assert result is not None
 
 
 async def test_connection_error(mock_api: aioresponses) -> None:
@@ -691,14 +713,49 @@ async def test_unexpected_status(mock_api: aioresponses) -> None:
 
 
 async def test_service_unavailable(mock_api: aioresponses) -> None:
-    """Test 503 raises WattwaechterConnectionError."""
+    """Test 503 raises WattwaechterConnectionError after all retries exhausted."""
+    for _ in range(3):
+        mock_api.get(
+            f"{BASE_URL}/system/info",
+            status=503,
+            headers={"Retry-After": "0"},
+        )
+    async with Wattwaechter("192.168.1.100", token="test") as client:
+        with pytest.raises(WattwaechterConnectionError, match="Device busy"):
+            await client.system_info()
+
+
+async def test_service_unavailable_retry_succeeds(mock_api: aioresponses) -> None:
+    """Test 503 is retried and succeeds on second attempt."""
     mock_api.get(
         f"{BASE_URL}/system/info",
         status=503,
-        headers={"Retry-After": "1"},
+        headers={"Retry-After": "0"},
+    )
+    mock_api.get(
+        f"{BASE_URL}/system/info",
+        payload={
+            "uptime": [],
+            "wifi": [],
+            "ap": [],
+            "esp": [],
+            "heap": [],
+        },
     )
     async with Wattwaechter("192.168.1.100", token="test") as client:
-        with pytest.raises(WattwaechterConnectionError, match="Device busy"):
+        result = await client.system_info()
+    assert result is not None
+
+
+async def test_max_retries_parameter(mock_api: aioresponses) -> None:
+    """Test max_retries=1 disables retry (fails on first 429)."""
+    mock_api.get(
+        f"{BASE_URL}/system/info",
+        status=429,
+        headers={"Retry-After": "0"},
+    )
+    async with Wattwaechter("192.168.1.100", token="test", max_retries=1) as client:
+        with pytest.raises(WattwaechterRateLimitError):
             await client.system_info()
 
 

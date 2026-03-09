@@ -27,9 +27,9 @@ async def main():
             print(f"Power: {data.power} W")
             print(f"Total consumption: {data.total_consumption} kWh")
 
-            # Access any OBIS code
+            # Access any OBIS code (short format, e.g. "1.8.0")
             for code, value in data.values.items():
-                print(f"  {code}: {value.value} {value.unit}")
+                print(f"  {value.name} ({code}): {value.value} {value.unit}")
 
         # Get system diagnostics
         info = await client.system_info()
@@ -39,6 +39,16 @@ async def main():
         ota = await client.ota_check()
         if ota.data.update_available:
             print(f"Update available: {ota.data.version}")
+
+        # Get 15-minute resolution history
+        history = await client.history_high_res("2024-03-08")
+        for entry in history.items:
+            print(f"  {entry.date}: {entry.power_w} W")
+        print(f"  Total import: {history.import_total_kwh} kWh")
+
+        # Get device logs
+        ram_log = await client.logs_ram()
+        print(f"RAM log: {len(ram_log)} bytes")
 
 asyncio.run(main())
 ```
@@ -63,12 +73,28 @@ client = Wattwaechter("192.168.1.100", token="your-read-token")
 client = Wattwaechter("192.168.1.100", token="your-write-token")
 ```
 
+## Automatic Retry
+
+The client automatically retries requests when the device returns **429** (rate limit) or **503** (busy). By default, up to 3 attempts are made, respecting the `Retry-After` header:
+
+```python
+# Default: 3 retries
+client = Wattwaechter("192.168.1.100")
+
+# Customize retry behavior
+client = Wattwaechter("192.168.1.100", max_retries=5)
+
+# Disable retries
+client = Wattwaechter("192.168.1.100", max_retries=1)
+```
+
 ## API Coverage
 
 | Category | Endpoints |
 |---|---|
 | System | `alive`, `system_info`, `led`, `selftest`, `wifi_scan`, `timezones`, `reboot` |
 | Meter Data | `meter_data`, `history_high_res`, `history_low_res` |
+| Logs | `logs_rawdump`, `logs_persistent`, `logs_ram` |
 | OTA | `ota_check`, `ota_start` |
 | Settings | `settings`, `update_settings` |
 | Auth | `generate_tokens`, `confirm_tokens`, `setup_token` |

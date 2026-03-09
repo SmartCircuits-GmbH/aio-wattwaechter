@@ -161,23 +161,30 @@ class MeterData:
         """Get a value by OBIS code (e.g. '16.7.0')."""
         return self.values.get(obis_code)
 
+    def _as_float(self, obis_code: str) -> float | None:
+        """Get a numeric OBIS value as float, or None."""
+        val = self.get(obis_code)
+        if val is None:
+            return None
+        try:
+            return float(val.value)
+        except (ValueError, TypeError):
+            return None
+
     @property
     def power(self) -> float | None:
         """Total active power in W (OBIS 16.7.0)."""
-        val = self.get("16.7.0")
-        return float(val.value) if val else None
+        return self._as_float("16.7.0")
 
     @property
     def total_consumption(self) -> float | None:
         """Total consumption in kWh (OBIS 1.8.0)."""
-        val = self.get("1.8.0")
-        return float(val.value) if val else None
+        return self._as_float("1.8.0")
 
     @property
     def total_feed_in(self) -> float | None:
         """Total feed-in in kWh (OBIS 2.8.0)."""
-        val = self.get("2.8.0")
-        return float(val.value) if val else None
+        return self._as_float("2.8.0")
 
 
 @dataclass(frozen=True)
