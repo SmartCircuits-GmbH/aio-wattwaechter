@@ -2,8 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from datetime import datetime
+from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
 
@@ -129,6 +128,15 @@ class WifiScanResponse:
     scanning: bool = False
 
 
+@dataclass(frozen=True)
+class TimezoneEntry:
+    """A supported timezone."""
+
+    name: str
+    gmt_offset: int
+    daylight_offset: int
+
+
 # --- History / Meter models ---
 
 
@@ -136,8 +144,9 @@ class WifiScanResponse:
 class ObisValue:
     """A single OBIS code value from the smart meter."""
 
-    value: float
+    value: float | str
     unit: str
+    name: str
 
 
 @dataclass(frozen=True)
@@ -149,26 +158,26 @@ class MeterData:
     values: dict[str, ObisValue]
 
     def get(self, obis_code: str) -> ObisValue | None:
-        """Get a value by OBIS code (e.g. '1-0:1.8.0')."""
+        """Get a value by OBIS code (e.g. '16.7.0')."""
         return self.values.get(obis_code)
 
     @property
     def power(self) -> float | None:
-        """Total active power in W (OBIS 1-0:16.7.0)."""
-        val = self.get("1-0:16.7.0")
-        return val.value if val else None
+        """Total active power in W (OBIS 16.7.0)."""
+        val = self.get("16.7.0")
+        return float(val.value) if val else None
 
     @property
     def total_consumption(self) -> float | None:
-        """Total consumption in kWh (OBIS 1-0:1.8.0)."""
-        val = self.get("1-0:1.8.0")
-        return val.value if val else None
+        """Total consumption in kWh (OBIS 1.8.0)."""
+        val = self.get("1.8.0")
+        return float(val.value) if val else None
 
     @property
     def total_feed_in(self) -> float | None:
-        """Total feed-in in kWh (OBIS 1-0:2.8.0)."""
-        val = self.get("1-0:2.8.0")
-        return val.value if val else None
+        """Total feed-in in kWh (OBIS 2.8.0)."""
+        val = self.get("2.8.0")
+        return float(val.value) if val else None
 
 
 @dataclass(frozen=True)
@@ -177,19 +186,11 @@ class HighResEntry:
 
     date: str
     timestamp: int
-    imp: float
-    exp: float
-    pwr: float
-    di: float
-    de: float
-
-
-@dataclass(frozen=True)
-class HighResSummary:
-    """Summary of high-resolution history data."""
-
-    total_import: float
-    total_export: float
+    import_total_kwh: float
+    export_total_kwh: float
+    import_kw: float
+    export_kw: float
+    power_w: float
 
 
 @dataclass(frozen=True)
@@ -199,7 +200,8 @@ class HighResHistory:
     start: str
     days: int
     items: list[HighResEntry]
-    summary: HighResSummary
+    import_total_kwh: float
+    export_total_kwh: float
 
 
 @dataclass(frozen=True)
@@ -207,10 +209,11 @@ class LowResEntry:
     """A single entry in low-resolution history data."""
 
     date: str
-    imp: float
-    exp: float
-    di: float
-    de: float
+    timestamp: int
+    import_total_kwh: float
+    export_total_kwh: float
+    import_kwh: float
+    export_kwh: float
 
 
 @dataclass(frozen=True)
@@ -218,9 +221,9 @@ class LowResHistory:
     """Response from GET /history/lowRes."""
 
     start: str
-    days: int
     items: list[LowResEntry]
-    summary: HighResSummary
+    import_total_kwh: float
+    export_total_kwh: float
 
 
 # --- OTA models ---
@@ -237,6 +240,8 @@ class OtaData:
     release_note_de: str
     release_note_en: str
     last_checked: int
+    url: str
+    md5: str
 
 
 @dataclass(frozen=True)
@@ -347,6 +352,15 @@ class CaCertStatus:
     custom_size: int
 
 
+@dataclass(frozen=True)
+class CaCertActionResponse:
+    """Response from POST/DELETE /mqtt/ca."""
+
+    success: bool
+    message: str
+    bundle_size: int
+
+
 # --- Parsing helpers ---
 
 
@@ -413,6 +427,18 @@ def _parse_wifi_scan(data: dict[str, Any]) -> WifiScanResponse:
     )
 
 
+def _parse_timezones(data: list[dict[str, Any]]) -> list[TimezoneEntry]:
+    """Parse timezones response."""
+    return [
+        TimezoneEntry(
+            name=tz["name"],
+            gmt_offset=tz["gmtOffset"],
+            daylight_offset=tz["daylightOffset"],
+        )
+        for tz in data
+    ]
+
+
 def _parse_meter_data(data: dict[str, Any]) -> MeterData:
     """Parse meter data response."""
     values: dict[str, ObisValue] = {}
@@ -422,7 +448,11 @@ def _parse_meter_data(data: dict[str, Any]) -> MeterData:
         if key in ("timestamp", "datetime"):
             continue
         if isinstance(val, dict) and "value" in val:
-            values[key] = ObisValue(value=val["value"], unit=val.get("unit", ""))
+            values[key] = ObisValue(
+                value=val["value"],
+                unit=val.get("unit", ""),
+                name=val.get("name", ""),
+            )
     return MeterData(
         timestamp=timestamp,
         datetime_str=datetime_str,
@@ -432,49 +462,43 @@ def _parse_meter_data(data: dict[str, Any]) -> MeterData:
 
 def _parse_high_res_history(data: dict[str, Any]) -> HighResHistory:
     """Parse high-resolution history response."""
-    summary_data = data.get("summary", {})
     return HighResHistory(
         start=data["start"],
-        days=data["days"],
+        days=data.get("days", 1),
         items=[
             HighResEntry(
                 date=item["date"],
                 timestamp=item["timestamp"],
-                imp=item["imp"],
-                exp=item["exp"],
-                pwr=item["pwr"],
-                di=item["di"],
-                de=item["de"],
+                import_total_kwh=item["import_total_kWh"],
+                export_total_kwh=item["export_total_kWh"],
+                import_kw=item.get("import_kW", 0.0),
+                export_kw=item.get("export_kW", 0.0),
+                power_w=item.get("power_W", 0.0),
             )
             for item in data.get("items", [])
         ],
-        summary=HighResSummary(
-            total_import=summary_data.get("total_import", 0.0),
-            total_export=summary_data.get("total_export", 0.0),
-        ),
+        import_total_kwh=data.get("import_total_kWh", 0.0),
+        export_total_kwh=data.get("export_total_kWh", 0.0),
     )
 
 
 def _parse_low_res_history(data: dict[str, Any]) -> LowResHistory:
     """Parse low-resolution history response."""
-    summary_data = data.get("summary", {})
     return LowResHistory(
         start=data["start"],
-        days=data["days"],
         items=[
             LowResEntry(
                 date=item["date"],
-                imp=item["imp"],
-                exp=item["exp"],
-                di=item["di"],
-                de=item["de"],
+                timestamp=item.get("timestamp", 0),
+                import_total_kwh=item.get("import_total_kWh", 0.0),
+                export_total_kwh=item.get("export_total_kWh", 0.0),
+                import_kwh=item.get("import_kWh", 0.0),
+                export_kwh=item.get("export_kWh", 0.0),
             )
             for item in data.get("items", [])
         ],
-        summary=HighResSummary(
-            total_import=summary_data.get("total_import", 0.0),
-            total_export=summary_data.get("total_export", 0.0),
-        ),
+        import_total_kwh=data.get("import_total_kWh", 0.0),
+        export_total_kwh=data.get("export_total_kWh", 0.0),
     )
 
 
@@ -491,6 +515,8 @@ def _parse_ota_check(data: dict[str, Any]) -> OtaCheckResponse:
             release_note_de=ota.get("release_note_de", ""),
             release_note_en=ota.get("release_note_en", ""),
             last_checked=ota.get("last_checked", 0),
+            url=ota.get("url", ""),
+            md5=ota.get("md5", ""),
         ),
     )
 
@@ -525,10 +551,10 @@ def _parse_settings(data: dict[str, Any]) -> Settings:
         mqtt=MqttConfig(
             enable=mqtt.get("enable", False),
             host=mqtt.get("host", ""),
-            port=mqtt.get("port", 1883),
-            use_tls=mqtt.get("use_tls", False),
+            port=mqtt.get("port", 8883),
+            use_tls=mqtt.get("use_tls", True),
             user=mqtt.get("user", ""),
-            sendInterval=mqtt.get("sendInterval", 10),
+            sendInterval=mqtt.get("sendInterval", 60),
             client_id=mqtt.get("client_id", ""),
             topic_prefix=mqtt.get("topic_prefix", ""),
         ),
@@ -568,4 +594,13 @@ def _parse_ca_cert_status(data: dict[str, Any]) -> CaCertStatus:
         has_custom_cert=data["has_custom_cert"],
         bundle_size=data["bundle_size"],
         custom_size=data["custom_size"],
+    )
+
+
+def _parse_ca_cert_action(data: dict[str, Any]) -> CaCertActionResponse:
+    """Parse CA certificate upload/delete response."""
+    return CaCertActionResponse(
+        success=data.get("success", False),
+        message=data.get("message", ""),
+        bundle_size=data.get("bundle_size", 0),
     )

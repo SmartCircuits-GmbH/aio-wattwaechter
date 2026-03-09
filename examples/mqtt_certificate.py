@@ -24,16 +24,17 @@ async def main() -> None:
             cert_path = Path("my-mqtt-ca.pem")
             if cert_path.exists():
                 cert = cert_path.read_text()
-                success = await client.mqtt_ca_upload(cert)
-                print(f"Upload: {'success' if success else 'failed'}")
+                result = await client.mqtt_ca_upload(cert)
+                print(f"Upload: {'success' if result.success else 'failed'}")
+                print(f"Bundle size: {result.bundle_size} bytes")
             else:
                 print(f"Certificate file not found: {cert_path}")
         else:
             # Optionally delete the custom certificate
             confirm = input("Delete custom certificate? (y/N): ")
             if confirm.lower() == "y":
-                success = await client.mqtt_ca_delete()
-                print(f"Delete: {'success' if success else 'failed'}")
+                result = await client.mqtt_ca_delete()
+                print(f"Delete: {'success' if result.success else 'failed'}")
 
 
 if __name__ == "__main__":

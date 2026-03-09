@@ -19,7 +19,7 @@ async def main() -> None:
         print()
         print("All OBIS values:")
         for code, val in data.values.items():
-            print(f"  {code}: {val.value} {val.unit}")
+            print(f"  {code}: {val.value} {val.unit} ({val.name})")
 
 
 if __name__ == "__main__":

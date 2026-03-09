@@ -10,11 +10,15 @@ import aiohttp
 
 from .exceptions import (
     WattwaechterAuthenticationError,
+    WattwaechterBadRequestError,
     WattwaechterConnectionError,
+    WattwaechterNotFoundError,
+    WattwaechterPayloadTooLargeError,
     WattwaechterRateLimitError,
 )
 from .models import (
     AliveResponse,
+    CaCertActionResponse,
     CaCertStatus,
     HighResHistory,
     LedInfo,
@@ -24,9 +28,11 @@ from .models import (
     SelfTestResult,
     Settings,
     SystemInfo,
+    TimezoneEntry,
     TokenGenerateResponse,
     WifiScanResponse,
     _parse_alive,
+    _parse_ca_cert_action,
     _parse_ca_cert_status,
     _parse_high_res_history,
     _parse_led_info,
@@ -36,6 +42,7 @@ from .models import (
     _parse_self_test,
     _parse_settings,
     _parse_system_info,
+    _parse_timezones,
     _parse_token_generate,
     _parse_wifi_scan,
 )
@@ -98,7 +105,7 @@ class Wattwaechter:
             headers["Authorization"] = f"Bearer {self._token}"
         return headers
 
-    async def _request(
+    async def _do_request(
         self,
         method: str,
         path: str,
@@ -106,20 +113,17 @@ class Wattwaechter:
         require_auth: bool = True,
         json_data: dict[str, Any] | None = None,
         params: dict[str, str] | None = None,
-    ) -> dict[str, Any]:
-        """Make an API request and return the JSON response.
+    ) -> aiohttp.ClientResponse:
+        """Execute an HTTP request and handle connection errors.
 
-        Raises:
-            WattwaechterConnectionError: On connection/timeout/unexpected errors.
-            WattwaechterAuthenticationError: On 401 responses.
-            WattwaechterRateLimitError: On 429 responses.
+        Returns the raw aiohttp response for further processing.
         """
         session = await self._ensure_session()
         url = f"{self._base_url}{path}"
 
         try:
             async with asyncio.timeout(self._request_timeout):
-                resp = await session.request(
+                return await session.request(
                     method,
                     url,
                     headers=self._headers(require_auth),
@@ -131,8 +135,30 @@ class Wattwaechter:
                 f"Cannot connect to {self._host}: {err}"
             ) from err
 
+    def _handle_error_status(self, resp: aiohttp.ClientResponse, path: str) -> None:
+        """Raise appropriate exceptions for HTTP error status codes."""
+        if resp.status == 400:
+            raise WattwaechterBadRequestError(
+                f"Bad request to {path}"
+            )
+
         if resp.status == 401:
             raise WattwaechterAuthenticationError("Invalid or missing API token")
+
+        if resp.status == 403:
+            raise WattwaechterAuthenticationError(
+                "Forbidden — insufficient permissions"
+            )
+
+        if resp.status == 404:
+            raise WattwaechterNotFoundError(
+                f"Resource not found: {path}"
+            )
+
+        if resp.status == 413:
+            raise WattwaechterPayloadTooLargeError(
+                "Request payload too large"
+            )
 
         if resp.status == 429:
             retry_after = resp.headers.get("Retry-After")
@@ -147,13 +173,34 @@ class Wattwaechter:
                 f"Device busy (503), retry after {retry_after}s"
             )
 
+    async def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        require_auth: bool = True,
+        json_data: dict[str, Any] | None = None,
+        params: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        """Make an API request and return the JSON response.
+
+        Raises:
+            WattwaechterConnectionError: On connection/timeout/unexpected errors.
+            WattwaechterAuthenticationError: On 401/403 responses.
+            WattwaechterBadRequestError: On 400 responses.
+            WattwaechterNotFoundError: On 404 responses.
+            WattwaechterPayloadTooLargeError: On 413 responses.
+            WattwaechterRateLimitError: On 429 responses.
+        """
+        resp = await self._do_request(
+            method, path, require_auth=require_auth,
+            json_data=json_data, params=params,
+        )
+
         if resp.status == 204:
             return {}
 
-        if resp.status == 403:
-            raise WattwaechterAuthenticationError(
-                "Forbidden — WRITE token required"
-            )
+        self._handle_error_status(resp, path)
 
         if resp.status not in (200, 202):
             raise WattwaechterConnectionError(
@@ -166,6 +213,34 @@ class Wattwaechter:
             raise WattwaechterConnectionError(
                 f"Invalid JSON response from {path}: {err}"
             ) from err
+
+    async def _request_text(
+        self,
+        method: str,
+        path: str,
+        *,
+        require_auth: bool = True,
+        params: dict[str, str] | None = None,
+    ) -> str | None:
+        """Make an API request and return the text response.
+
+        Returns None if no content is available (HTTP 204).
+        """
+        resp = await self._do_request(
+            method, path, require_auth=require_auth, params=params,
+        )
+
+        if resp.status == 204:
+            return None
+
+        self._handle_error_status(resp, path)
+
+        if resp.status not in (200, 202):
+            raise WattwaechterConnectionError(
+                f"Unexpected status {resp.status} from {path}"
+            )
+
+        return await resp.text()
 
     # --- System endpoints ---
 
@@ -212,12 +287,21 @@ class Wattwaechter:
         )
         return _parse_wifi_scan(data)
 
-    async def timezones(self) -> dict[str, str]:
+    async def timezones(self) -> list[TimezoneEntry]:
         """Get all supported timezones.
 
         GET /api/v1/system/timezones
+        Returns list of TimezoneEntry with name, gmt_offset, daylight_offset.
         """
-        return await self._request("GET", "/system/timezones")
+        resp = await self._do_request("GET", "/system/timezones")
+        self._handle_error_status(resp, "/system/timezones")
+        try:
+            data = await resp.json()
+        except (aiohttp.ContentTypeError, ValueError) as err:
+            raise WattwaechterConnectionError(
+                f"Invalid JSON response from /system/timezones: {err}"
+            ) from err
+        return _parse_timezones(data)
 
     async def reboot(self) -> bool:
         """Reboot the device (requires WRITE token).
@@ -267,6 +351,40 @@ class Wattwaechter:
             params={"start": start, "days": str(days)},
         )
         return _parse_low_res_history(data)
+
+    # --- Log endpoints ---
+
+    async def logs_rawdump(self) -> bytes | None:
+        """Get raw smart meter buffer dump (binary SML data).
+
+        GET /api/v1/logs/rawdump
+        Returns None if no data is available (HTTP 204).
+        """
+        resp = await self._do_request("GET", "/logs/rawdump")
+        if resp.status == 204:
+            return None
+        self._handle_error_status(resp, "/logs/rawdump")
+        if resp.status not in (200, 202):
+            raise WattwaechterConnectionError(
+                f"Unexpected status {resp.status} from /logs/rawdump"
+            )
+        return await resp.read()
+
+    async def logs_persistent(self) -> str:
+        """Get persistent CSV log file from device storage.
+
+        GET /api/v1/logs/persistent
+        """
+        result = await self._request_text("GET", "/logs/persistent")
+        return result or ""
+
+    async def logs_ram(self) -> str:
+        """Get current RAM log snapshot.
+
+        GET /api/v1/logs/ram
+        """
+        result = await self._request_text("GET", "/logs/ram")
+        return result or ""
 
     # --- OTA endpoints ---
 
@@ -344,6 +462,7 @@ class Wattwaechter:
 
         GET /api/v1/setup/token
         Returns dict with 'readToken' and 'writeToken'.
+        Raises WattwaechterAuthenticationError (403) if initial setup is complete.
         """
         return await self._request(
             "GET", "/setup/token", require_auth=False
@@ -359,7 +478,7 @@ class Wattwaechter:
         data = await self._request("GET", "/mqtt/ca")
         return _parse_ca_cert_status(data)
 
-    async def mqtt_ca_upload(self, certificate: str) -> bool:
+    async def mqtt_ca_upload(self, certificate: str) -> CaCertActionResponse:
         """Upload a custom CA certificate for MQTT TLS (requires WRITE token).
 
         POST /api/v1/mqtt/ca
@@ -370,15 +489,16 @@ class Wattwaechter:
         data = await self._request(
             "POST", "/mqtt/ca", json_data={"certificate": certificate}
         )
-        return data.get("success", False)
+        return _parse_ca_cert_action(data)
 
-    async def mqtt_ca_delete(self) -> bool:
+    async def mqtt_ca_delete(self) -> CaCertActionResponse:
         """Delete the custom CA certificate (requires WRITE token).
 
         DELETE /api/v1/mqtt/ca
+        Raises WattwaechterNotFoundError if no custom certificate exists.
         """
         data = await self._request("DELETE", "/mqtt/ca")
-        return data.get("success", False)
+        return _parse_ca_cert_action(data)
 
     # --- Cloud pairing endpoints ---
 
